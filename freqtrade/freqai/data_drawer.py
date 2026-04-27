@@ -23,6 +23,11 @@ from freqtrade.data.history import load_pair_history
 from freqtrade.enums import CandleType
 from freqtrade.exceptions import OperationalException
 from freqtrade.freqai.data_kitchen import FreqaiDataKitchen
+from freqtrade.freqai.pickle_security import (
+    _get_or_create_hmac_key,
+    save_hmac_signature,
+    verify_hmac_signature,
+)
 from freqtrade.strategy.interface import IStrategy
 
 
@@ -104,6 +109,8 @@ class FreqaiDataDrawer:
             "extras": {},
         }
         self.model_type = self.freqai_info.get("model_save_type", "joblib")
+        # Initialize HMAC key for pickle file integrity verification
+        self._hmac_key = _get_or_create_hmac_key(self.full_path)
 
     def update_metric_tracker(self, metric: str, value: float, pair: str) -> None:
         """
@@ -177,6 +184,11 @@ class FreqaiDataDrawer:
         exists = self.historic_predictions_path.is_file()
         if exists:
             try:
+                if not verify_hmac_signature(self.historic_predictions_path, self._hmac_key):
+                    raise OperationalException(
+                        f"HMAC verification failed for '{self.historic_predictions_path}'. "
+                        "The file may have been tampered with."
+                    )
                 with self.historic_predictions_path.open("rb") as fp:
                     self.historic_predictions = cloudpickle.load(fp)
                 logger.info(
@@ -188,6 +200,11 @@ class FreqaiDataDrawer:
                 logger.warning(
                     "Historical prediction file was corrupted. Trying to load backup file."
                 )
+                if not verify_hmac_signature(self.historic_predictions_bkp_path, self._hmac_key):
+                    raise OperationalException(
+                        f"HMAC verification failed for '{self.historic_predictions_bkp_path}'. "
+                        "The file may have been tampered with."
+                    )
                 with self.historic_predictions_bkp_path.open("rb") as fp:
                     self.historic_predictions = cloudpickle.load(fp)
                 logger.warning("FreqAI successfully loaded the backup historical predictions file.")
@@ -203,9 +220,11 @@ class FreqaiDataDrawer:
         """
         with self.historic_predictions_path.open("wb") as fp:
             cloudpickle.dump(self.historic_predictions, fp, protocol=cloudpickle.DEFAULT_PROTOCOL)
+        save_hmac_signature(self.historic_predictions_path, self._hmac_key)
 
         # create a backup
         shutil.copy(self.historic_predictions_path, self.historic_predictions_bkp_path)
+        save_hmac_signature(self.historic_predictions_bkp_path, self._hmac_key)
 
     def save_metric_tracker_to_disk(self):
         """
@@ -515,8 +534,10 @@ class FreqaiDataDrawer:
 
         # Save the trained model
         if self.model_type == "joblib":
-            with (save_path / f"{dk.model_filename}_model.joblib").open("wb") as fp:
+            joblib_path = save_path / f"{dk.model_filename}_model.joblib"
+            with joblib_path.open("wb") as fp:
                 cloudpickle.dump(model, fp)
+            save_hmac_signature(joblib_path, self._hmac_key)
         elif self.model_type == "keras":
             model.save(save_path / f"{dk.model_filename}_model.h5")
         elif self.model_type in ["stable_baselines3", "sb3_contrib", "pytorch"]:
@@ -531,11 +552,15 @@ class FreqaiDataDrawer:
             rapidjson.dump(dk.data, fp, default=self.np_encoder, number_mode=METADATA_NUMBER_MODE)
 
         # save the pipelines to pickle files
-        with (save_path / f"{dk.model_filename}_{FEATURE_PIPELINE}.pkl").open("wb") as fp:
+        feature_pkl_path = save_path / f"{dk.model_filename}_{FEATURE_PIPELINE}.pkl"
+        with feature_pkl_path.open("wb") as fp:
             cloudpickle.dump(dk.feature_pipeline, fp)
+        save_hmac_signature(feature_pkl_path, self._hmac_key)
 
-        with (save_path / f"{dk.model_filename}_{LABEL_PIPELINE}.pkl").open("wb") as fp:
+        label_pkl_path = save_path / f"{dk.model_filename}_{LABEL_PIPELINE}.pkl"
+        with label_pkl_path.open("wb") as fp:
             cloudpickle.dump(dk.label_pipeline, fp)
+        save_hmac_signature(label_pkl_path, self._hmac_key)
 
         # save the train data to file for post processing if desired
         dk.data_dictionary["train_features"].to_pickle(
@@ -569,7 +594,7 @@ class FreqaiDataDrawer:
             dk.training_features_list = dk.data["training_features_list"]
             dk.label_list = dk.data["label_list"]
 
-    def load_data(self, coin: str, dk: FreqaiDataKitchen) -> Any:
+    def load_data(self, coin: str, dk: FreqaiDataKitchen) -> Any:  # noqa: C901
         """
         loads all data required to make a prediction on a sub-train time range
         :returns:
@@ -591,9 +616,22 @@ class FreqaiDataDrawer:
             with (dk.data_path / f"{dk.model_filename}_{METADATA}.json").open("r") as fp:
                 dk.data = rapidjson.load(fp, number_mode=METADATA_NUMBER_MODE)
 
-            with (dk.data_path / f"{dk.model_filename}_{FEATURE_PIPELINE}.pkl").open("rb") as fp:
+            feature_pkl = dk.data_path / f"{dk.model_filename}_{FEATURE_PIPELINE}.pkl"
+            if not verify_hmac_signature(feature_pkl, self._hmac_key):
+                raise OperationalException(
+                    f"HMAC verification failed for '{feature_pkl}'. "
+                    "The file may have been tampered with."
+                )
+            with feature_pkl.open("rb") as fp:
                 dk.feature_pipeline = cloudpickle.load(fp)
-            with (dk.data_path / f"{dk.model_filename}_{LABEL_PIPELINE}.pkl").open("rb") as fp:
+
+            label_pkl = dk.data_path / f"{dk.model_filename}_{LABEL_PIPELINE}.pkl"
+            if not verify_hmac_signature(label_pkl, self._hmac_key):
+                raise OperationalException(
+                    f"HMAC verification failed for '{label_pkl}'. "
+                    "The file may have been tampered with."
+                )
+            with label_pkl.open("rb") as fp:
                 dk.label_pipeline = cloudpickle.load(fp)
 
         dk.training_features_list = dk.data["training_features_list"]
@@ -603,7 +641,13 @@ class FreqaiDataDrawer:
         if dk.live and coin in self.model_dictionary:
             model = self.model_dictionary[coin]
         elif self.model_type == "joblib":
-            with (dk.data_path / f"{dk.model_filename}_model.joblib").open("rb") as fp:
+            joblib_path = dk.data_path / f"{dk.model_filename}_model.joblib"
+            if not verify_hmac_signature(joblib_path, self._hmac_key):
+                raise OperationalException(
+                    f"HMAC verification failed for '{joblib_path}'. "
+                    "The file may have been tampered with."
+                )
+            with joblib_path.open("rb") as fp:
                 model = cloudpickle.load(fp)
         elif "stable_baselines" in self.model_type or "sb3_contrib" == self.model_type:
             mod = importlib.import_module(
@@ -614,8 +658,18 @@ class FreqaiDataDrawer:
         elif self.model_type == "pytorch":
             import torch
 
+            torch_model_path = dk.data_path / f"{dk.model_filename}_model.zip"
+            if not verify_hmac_signature(torch_model_path, self._hmac_key):
+                raise OperationalException(
+                    f"HMAC verification failed for '{torch_model_path}'. "
+                    "The file may have been tampered with."
+                )
+            logger.warning(
+                "Loading PyTorch model with weights_only=False. "
+                "Ensure this model file comes from a trusted source."
+            )
             zipfile = torch.load(
-                dk.data_path / f"{dk.model_filename}_model.zip",
+                torch_model_path,
                 weights_only=False,
             )
             # weights_only is necessary due to pytrainer being a serialized python object.

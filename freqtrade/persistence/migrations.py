@@ -1,4 +1,5 @@
 import logging
+import re
 
 from sqlalchemy import Engine, inspect, select, text, update
 
@@ -7,6 +8,26 @@ from freqtrade.persistence.trade_model import Order, Trade
 
 
 logger = logging.getLogger(__name__)
+
+# Regex pattern for valid SQL identifiers (alphanumeric + underscores, starting with letter or _)
+_VALID_SQL_IDENTIFIER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+
+def _validate_identifier(name: str) -> str:
+    """
+    Validate that a string is a safe SQL identifier to prevent SQL injection
+    in migration queries that use f-string formatted table/sequence names.
+
+    :param name: identifier name to validate
+    :return: the validated name
+    :raises OperationalException: if the name contains invalid characters
+    """
+    if not _VALID_SQL_IDENTIFIER.match(name):
+        raise OperationalException(
+            f"Invalid SQL identifier '{name}'. "
+            "Only alphanumeric characters and underscores are allowed."
+        )
+    return name
 
 
 def get_table_names_for_table(inspector, tabletype: str) -> list[str]:
@@ -31,6 +52,8 @@ def get_backup_name(tabs: list[str], backup_prefix: str):
 
 
 def get_last_sequence_ids(engine, sequence_name: str, table_back_name: str) -> int | None:
+    _validate_identifier(sequence_name)
+    _validate_identifier(table_back_name)
     last_id: int | None = None
 
     if engine.name == "postgresql":
@@ -92,6 +115,7 @@ def set_sequence_ids(
 
 
 def drop_index_on_table(engine, inspector, table_bak_name):
+    _validate_identifier(table_bak_name)
     with engine.begin() as connection:
         # drop indexes on backup table in new session
         for index in inspector.get_indexes(table_bak_name):
@@ -182,6 +206,7 @@ def migrate_trades_and_orders_table(
     )
 
     # Schema migration necessary
+    _validate_identifier(trade_back_name)
     with engine.begin() as connection:
         connection.execute(text(f"alter table trades rename to {trade_back_name}"))
 
@@ -256,6 +281,7 @@ def migrate_trades_and_orders_table(
 def drop_orders_table(engine, table_back_name: str):
     # Drop and recreate orders table as backup
     # This drops foreign keys, too.
+    _validate_identifier(table_back_name)
 
     with engine.begin() as connection:
         connection.execute(text(f"create table {table_back_name} as select * from orders"))
@@ -296,6 +322,7 @@ def migrate_orders_table(engine, table_back_name: str, cols_order: list):
 
 def migrate_pairlocks_table(decl_base, inspector, engine, pairlock_back_name: str, cols: list):
     # Schema migration necessary
+    _validate_identifier(pairlock_back_name)
     with engine.begin() as connection:
         connection.execute(text(f"alter table pairlocks rename to {pairlock_back_name}"))
 
@@ -325,6 +352,7 @@ def migrate_pairlocks_table(decl_base, inspector, engine, pairlock_back_name: st
 
 def migrate_kv_store_table(decl_base, inspector, engine, kv_store_back_name: str, cols: list):
     # Schema migration necessary
+    _validate_identifier(kv_store_back_name)
     with engine.begin() as connection:
         connection.execute(text(f'alter table "KeyValueStore" rename to "{kv_store_back_name}"'))
 

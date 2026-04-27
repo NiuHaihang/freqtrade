@@ -1,4 +1,5 @@
 import logging
+import secrets
 from contextlib import asynccontextmanager
 from ipaddress import ip_address
 from typing import Any
@@ -271,8 +272,14 @@ class ApiServer(RPCHandler):
             CORSMiddleware,
             allow_origins=config["api_server"].get("CORS_origins", []),
             allow_credentials=True,
-            allow_methods=["*"],
-            allow_headers=["*"],
+            allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+            allow_headers=[
+                "Authorization",
+                "Content-Type",
+                "Accept",
+                "Origin",
+                "X-Requested-With",
+            ],
         )
 
         app.add_exception_handler(RPCException, self.handle_rpc_exception)
@@ -293,9 +300,12 @@ class ApiServer(RPCHandler):
             )
 
         if not self._config["api_server"].get("password"):
+            generated_password = secrets.token_urlsafe(16)
+            self._config["api_server"]["password"] = generated_password
             logger.warning(
                 "SECURITY WARNING - No password for local REST Server defined. "
-                "Please make sure that this is intentional!"
+                f"Auto-generated temporary password: {generated_password} "
+                "Please set a permanent password in your config.json."
             )
 
         if self._config["api_server"].get("jwt_secret_key", "super-secret") in (
@@ -303,9 +313,12 @@ class ApiServer(RPCHandler):
             "somethingrandom",
             "somethingRandomSomethingRandom123",
         ):
+            generated_jwt_key = secrets.token_hex(32)
+            self._config["api_server"]["jwt_secret_key"] = generated_jwt_key
             logger.warning(
-                "SECURITY WARNING - `jwt_secret_key` seems to be default."
-                "Others may be able to log into your bot."
+                "SECURITY WARNING - `jwt_secret_key` was set to a known default value. "
+                "A random key has been auto-generated for this session. "
+                "Please set a permanent jwt_secret_key in your config.json."
             )
 
         logger.info("Starting Local Rest Server.")
